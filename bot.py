@@ -98,21 +98,94 @@ def decode_email_header(header):
 
 
 def get_email_text(email_message):
-    """Извлекает текст из письма"""
+    """Извлекает текст из письма, обрабатывая как plain text, так и HTML"""
     text = ""
+
+    def extract_text_from_html(html_content):
+        """Извлекает текст из HTML, тщательно очищая теги и стили"""
+        # Удаляем CSS стили
+        html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL)
+
+        # Удаляем скрипты
+        html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL)
+
+        # Заменяем <br>, <p>, <div> на переносы строк
+        html_content = re.sub(r'<br[^>]*>', '\n', html_content)
+        html_content = re.sub(r'</p>\s*<p[^>]*>', '\n\n', html_content)
+        html_content = re.sub(r'<div[^>]*>', '\n', html_content)
+        html_content = re.sub(r'</div>', '\n', html_content)
+
+        # Удаляем все оставшиеся HTML теги
+        html_content = re.sub(r'<[^>]+>', '', html_content)
+
+        # Заменяем множественные переносы строк на двойной перенос
+        html_content = re.sub(r'\n\s*\n', '\n\n', html_content)
+
+        # Заменяем множественные пробелы на один
+        html_content = re.sub(r'\s+', ' ', html_content)
+
+        # Декодируем HTML сущности
+        html_entities = {
+            '&nbsp;': ' ',
+            '&amp;': '&',
+            '&lt;': '<',
+            '&gt;': '>',
+            '&quot;': '"',
+            '&apos;': "'",
+            '&#x27;': "'",
+            '&#x2F;': '/',
+            '&mdash;': '—',
+            '&ndash;': '–',
+            '&laquo;': '«',
+            '&raquo;': '»',
+        }
+        for entity, char in html_entities.items():
+            html_content = html_content.replace(entity, char)
+
+        # Удаляем пустые строки в начале и конце
+        return html_content.strip()
+
     if email_message.is_multipart():
         for part in email_message.walk():
-            if part.get_content_type() == "text/plain":
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
+
+            # Пропускаем вложения
+            if "attachment" in content_disposition:
+                continue
+
+            if content_type == "text/plain":
                 try:
                     text += part.get_payload(decode=True).decode()
                 except:
                     text += part.get_payload()
+            elif content_type == "text/html":
+                try:
+                    html_content = part.get_payload(decode=True).decode()
+                    text += extract_text_from_html(html_content)
+                except:
+                    text += extract_text_from_html(part.get_payload())
     else:
-        try:
-            text = email_message.get_payload(decode=True).decode()
-        except:
-            text = email_message.get_payload()
-    return text.strip()
+        content_type = email_message.get_content_type()
+        if content_type == "text/plain":
+            try:
+                text = email_message.get_payload(decode=True).decode()
+            except:
+                text = email_message.get_payload()
+        elif content_type == "text/html":
+            try:
+                html_content = email_message.get_payload(decode=True).decode()
+                text = extract_text_from_html(html_content)
+            except:
+                text = extract_text_from_html(email_message.get_payload())
+
+    # Обрабатываем текст для сохранения структуры абзацев
+    # Разбиваем на абзацы
+    paragraphs = text.split('\n\n')
+    # Удаляем пустые абзацы и лишние пробелы
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    # Собираем обратно с сохранением структуры
+    return '\n\n'.join(paragraphs)
 
 
 def format_email_date(date_str):
