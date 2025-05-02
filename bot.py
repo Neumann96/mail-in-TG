@@ -54,6 +54,11 @@ YANDEX_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_TOKEN_URL = "https://oauth.yandex.ru/token"
 YANDEX_SCOPES = "mail:imap_full"  # Полный доступ к почте через IMAP
 
+# Gmail OAuth configuration
+GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SCOPES = "https://mail.google.com/"  # Полный доступ к Gmail
+
 # Store user tokens and email credentials
 user_tokens = {}
 user_credentials = {}
@@ -218,16 +223,19 @@ def format_email_date(date_str):
 async def check_emails(user_id: int):
     logging.info(f"Starting email check for user {user_id}")
 
-    # Инициализируем список последних ID для пользователя
     if user_id not in last_email_ids:
         last_email_ids[user_id] = set()
-        # При первом запуске получаем текущие ID писем, но не отправляем их
         try:
             credentials = user_credentials[user_id]
-            imap = imaplib.IMAP4_SSL('imap.yandex.ru')
-            # Используем OAuth токен для авторизации
-            imap.authenticate('XOAUTH2',
-                              lambda x: f"user={credentials['email']}\1auth=Bearer {credentials['access_token']}\1\1")
+            if credentials['service'] == 'gmail':
+                imap = imaplib.IMAP4_SSL('imap.gmail.com')
+                imap.authenticate('XOAUTH2', lambda
+                    x: f"user={credentials['email']}\1auth=Bearer {credentials['access_token']}\1\1")
+            else:
+                imap = imaplib.IMAP4_SSL('imap.yandex.ru')
+                imap.authenticate('XOAUTH2', lambda
+                    x: f"user={credentials['email']}\1auth=Bearer {credentials['access_token']}\1\1")
+
             imap.select('INBOX')
             status, messages = imap.search(None, 'ALL')
             if status == 'OK':
@@ -240,50 +248,38 @@ async def check_emails(user_id: int):
     while user_id in user_credentials:
         try:
             credentials = user_credentials[user_id]
-            # Подключаемся к IMAP серверу
-            imap = imaplib.IMAP4_SSL('imap.yandex.ru')
-            # Используем OAuth токен для авторизации
+            if credentials['service'] == 'gmail':
+                imap = imaplib.IMAP4_SSL('imap.gmail.com')
+            else:
+                imap = imaplib.IMAP4_SSL('imap.yandex.ru')
+
             imap.authenticate('XOAUTH2',
                               lambda x: f"user={credentials['email']}\1auth=Bearer {credentials['access_token']}\1\1")
-
-            # Выбираем папку входящих
             imap.select('INBOX')
-
-            # Получаем все письма
             status, messages = imap.search(None, 'ALL')
 
             if status == 'OK':
-                # Получаем ID всех писем
                 current_ids = set(messages[0].split())
-
-                # Проверяем только новые письма (те, которых нет в last_email_ids)
                 new_ids = current_ids - last_email_ids[user_id]
 
                 if new_ids:
-                    # Обрабатываем только новые письма
-                    for msg_id in reversed(
-                            sorted(new_ids)):  # Сортируем в обратном порядке, чтобы получить сначала новые
+                    for msg_id in reversed(sorted(new_ids)):
                         try:
-                            # Получаем письмо
                             status, msg_data = imap.fetch(msg_id, '(RFC822)')
                             if status == 'OK':
                                 email_body = msg_data[0][1]
                                 email_message = email.message_from_bytes(email_body)
 
-                                # Получаем информацию о письме
                                 subject = decode_email_header(email_message['subject'] or 'Без темы')
                                 from_addr = decode_email_header(email_message['from'] or 'Неизвестно')
                                 date_str = email_message['date']
                                 date = format_email_date(date_str) if date_str else 'Дата неизвестна'
                                 full_text = get_email_text(email_message)
 
-                                # Формируем короткое сообщение
                                 short_text = full_text[:200] + "..." if len(full_text) > 200 else full_text
 
-                                # Создаем уникальный идентификатор для письма
                                 email_id = f"{user_id}_{msg_id.decode()}"
 
-                                # Создаем клавиатуру с кнопкой "Показать полностью"
                                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
                                     [InlineKeyboardButton(
                                         text="📖 Показать полностью",
@@ -291,7 +287,6 @@ async def check_emails(user_id: int):
                                     )]
                                 ])
 
-                                # Формируем сообщение
                                 message_text = (
                                     f"📧 Новое письмо:\n"
                                     f"От: {from_addr}\n"
@@ -300,7 +295,6 @@ async def check_emails(user_id: int):
                                     f"Текст письма:\n{short_text}"
                                 )
 
-                                # Сохраняем полный текст для этого сообщения
                                 if 'email_texts' not in user_credentials[user_id]:
                                     user_credentials[user_id]['email_texts'] = {}
                                 user_credentials[user_id]['email_texts'][email_id] = {
@@ -317,7 +311,6 @@ async def check_emails(user_id: int):
                             logging.error(f"Error processing email {msg_id}: {str(e)}")
                             continue
 
-                # Обновляем список последних ID
                 last_email_ids[user_id] = current_ids
 
             imap.close()
@@ -333,11 +326,11 @@ async def check_emails(user_id: int):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Авторизоваться в Яндекс", callback_data="auth_yandex")]
+        [InlineKeyboardButton(text="🔑 Яндекс Почта", callback_data="auth_yandex")]
     ])
     await message.answer(
-        "Привет! Я бот для работы с Яндекс Почтой.\n"
-        "Нажмите кнопку ниже, чтобы авторизоваться:",
+        "Привет! Я бот для работы с почтой.\n"
+        "Выберите почтовый сервис для авторизации:",
         reply_markup=keyboard
     )
 
@@ -360,12 +353,26 @@ async def process_auth_button(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "auth_gmail")
+async def process_gmail_auth(callback: types.CallbackQuery, state: FSMContext):
+    # Получаем redirect_uri из .env или используем стандартный
+    redirect_uri = os.getenv('GMAIL_REDIRECT_URI', 'https://oauth2.googleapis.com/verification_code')
+
+    auth_url = f"{GMAIL_AUTH_URL}?response_type=code&client_id={os.getenv('GMAIL_CLIENT_ID')}&redirect_uri={redirect_uri}&scope={GMAIL_SCOPES}&access_type=offline&prompt=consent"
+
+    await callback.message.answer(
+        f"Пожалуйста, перейдите по ссылке для авторизации в Gmail:\n{auth_url}\n\n"
+        "После авторизации, отправьте мне полученный код."
+    )
+    await state.set_state(AuthStates.waiting_for_auth)
+    await callback.answer()
+
+
 @dp.message(AuthStates.waiting_for_auth)
 async def process_auth_code(message: types.Message, state: FSMContext):
     auth_code = message.text.strip()
 
-    # Проверяем, является ли сообщение кодом (код может содержать буквы и цифры)
-    if not auth_code or len(auth_code) < 4:  # Минимальная длина кода обычно 4 символа
+    if not auth_code or len(auth_code) < 4:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
         ])
@@ -377,40 +384,50 @@ async def process_auth_code(message: types.Message, state: FSMContext):
 
     try:
         async with aiohttp.ClientSession() as session:
+            # Определяем, какой сервис используется
+            if 'gmail' in message.text.lower():
+                token_url = GMAIL_TOKEN_URL
+                client_id = os.getenv('GMAIL_CLIENT_ID')
+                client_secret = os.getenv('GMAIL_CLIENT_SECRET')
+                user_info_url = 'https://www.googleapis.com/oauth2/v3/userinfo'
+            else:
+                token_url = YANDEX_TOKEN_URL
+                client_id = os.getenv('YANDEX_CLIENT_ID')
+                client_secret = os.getenv('YANDEX_CLIENT_SECRET')
+                user_info_url = 'https://login.yandex.ru/info'
+
             # Exchange auth code for access token
-            async with session.post(YANDEX_TOKEN_URL, data={
+            async with session.post(token_url, data={
                 'grant_type': 'authorization_code',
                 'code': auth_code,
-                'client_id': os.getenv('YANDEX_CLIENT_ID'),
-                'client_secret': os.getenv('YANDEX_CLIENT_SECRET')
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'redirect_uri': os.getenv(
+                    'GMAIL_REDIRECT_URI' if 'gmail' in message.text.lower() else 'YANDEX_REDIRECT_URI')
             }) as response:
                 if response.status == 200:
                     token_data = await response.json()
-                    logging.info(f"Successfully received token data: {token_data}")
 
                     # Получаем email пользователя
-                    async with session.get('https://login.yandex.ru/info', headers={
-                        'Authorization': f'OAuth {token_data["access_token"]}'
+                    async with session.get(user_info_url, headers={
+                        'Authorization': f'Bearer {token_data["access_token"]}'
                     }) as user_info_response:
                         if user_info_response.status == 200:
                             user_info = await user_info_response.json()
-                            logging.info(f"Received user info: {user_info}")
 
-                            # Пробуем получить email разными способами
-                            email = None
-                            if 'default_email' in user_info:
-                                email = user_info['default_email']
-                            elif 'emails' in user_info and user_info['emails']:
-                                email = user_info['emails'][0]
-                            elif 'login' in user_info:
-                                email = f"{user_info['login']}@yandex.ru"
+                            # Получаем email в зависимости от сервиса
+                            if 'gmail' in message.text.lower():
+                                email = user_info.get('email')
+                            else:
+                                email = user_info.get('default_email') or user_info.get('emails', [None])[
+                                    0] or f"{user_info.get('login')}@yandex.ru"
 
                             if email:
-                                # Сохраняем данные пользователя
                                 user_credentials[message.from_user.id] = {
                                     'email': email,
                                     'access_token': token_data['access_token'],
-                                    'refresh_token': token_data.get('refresh_token')
+                                    'refresh_token': token_data.get('refresh_token'),
+                                    'service': 'gmail' if 'gmail' in message.text.lower() else 'yandex'
                                 }
 
                                 await message.answer(
@@ -421,59 +438,24 @@ async def process_auth_code(message: types.Message, state: FSMContext):
                                 # Start email checking loop
                                 asyncio.create_task(check_emails(message.from_user.id))
                             else:
-                                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
-                                ])
-                                logging.error(f"Could not determine email from user info: {user_info}")
                                 await message.answer(
                                     "❌ Не удалось определить email пользователя. "
-                                    "Пожалуйста, убедитесь, что у вас есть доступ к Яндекс.Почте.\n"
-                                    "Попробуйте отправить код еще раз.",
-                                    reply_markup=keyboard
+                                    "Пожалуйста, убедитесь, что у вас есть доступ к почте.\n"
+                                    "Попробуйте отправить код еще раз."
                                 )
                         else:
-                            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
-                            ])
-                            error_text = await user_info_response.text()
-                            logging.error(f"Error getting user info: {user_info_response.status} - {error_text}")
                             await message.answer(
                                 "❌ Ошибка при получении информации о пользователе. "
-                                "Пожалуйста, попробуйте отправить код еще раз.",
-                                reply_markup=keyboard
+                                "Пожалуйста, попробуйте отправить код еще раз."
                             )
                 else:
-                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
-                    ])
-                    response_text = await response.text()
-                    logging.error(f"Token request failed: {response.status} - {response_text}")
-                    error_data = await response.json()
-
-                    if error_data.get('error') == 'invalid_grant':
-                        # Код истек, предлагаем повторить авторизацию
-                        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🔄 Повторить авторизацию", callback_data="auth_yandex")],
-                            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
-                        ])
-                        await message.answer(
-                            "❌ Код авторизации истек. Пожалуйста, повторите процесс авторизации.",
-                            reply_markup=keyboard
-                        )
-                    else:
-                        await message.answer(
-                            "❌ Ошибка авторизации. Пожалуйста, попробуйте отправить код еще раз.",
-                            reply_markup=keyboard
-                        )
+                    await message.answer(
+                        "❌ Ошибка авторизации. Пожалуйста, попробуйте отправить код еще раз."
+                    )
     except Exception as e:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_auth")]
-        ])
-        logging.error(f"Error during token exchange: {str(e)}")
         await message.answer(
             f"❌ Произошла ошибка: {str(e)}\n"
-            "Пожалуйста, попробуйте отправить код еще раз.",
-            reply_markup=keyboard
+            "Пожалуйста, попробуйте отправить код еще раз."
         )
 
 
