@@ -16,6 +16,8 @@ from email.header import decode_header
 import re
 import locale
 import dateparser
+import base64
+from urllib.parse import quote_plus
 
 # Устанавливаем русскую локаль с правильной кодировкой
 try:
@@ -49,10 +51,20 @@ class AuthStates(StatesGroup):
     waiting_for_auth = State()
 
 
+class SendMailStates(StatesGroup):
+    waiting_for_recipient = State()
+    waiting_for_subject = State()
+    waiting_for_body = State()
+
+
+class ReplyMailStates(StatesGroup):
+    waiting_for_reply_body = State()
+
+
 # Yandex OAuth configuration
 YANDEX_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_TOKEN_URL = "https://oauth.yandex.ru/token"
-YANDEX_SCOPES = "mail:imap_full"  # Полный доступ к почте через IMAP
+YANDEX_SCOPES = "mail:imap_full mail:smtp_full"  # Добавляем scope для SMTP
 
 # Gmail OAuth configuration
 GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -284,6 +296,10 @@ async def check_emails(user_id: int):
                                     [InlineKeyboardButton(
                                         text="📖 Показать полностью",
                                         callback_data=f"show_full_{email_id}"
+                                    )],
+                                    [InlineKeyboardButton(
+                                        text="✉️ Ответить",
+                                        callback_data=f"reply_to_{email_id}"
                                     )]
                                 ])
 
@@ -326,7 +342,8 @@ async def check_emails(user_id: int):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Яндекс Почта", callback_data="auth_yandex")]
+        [InlineKeyboardButton(text="🔑 Яндекс Почта", callback_data="auth_yandex")],
+        [InlineKeyboardButton(text="📧 Gmail (ещё в разработке)", callback_data="gmail_stub")]
     ])
     await message.answer(
         "Привет! Я бот для работы с почтой.\n"
@@ -337,14 +354,10 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query(F.data == "auth_yandex")
 async def process_auth_button(callback: types.CallbackQuery, state: FSMContext):
-    # Получаем redirect_uri из .env или используем стандартный
     redirect_uri = os.getenv('YANDEX_REDIRECT_URI', 'https://oauth.yandex.ru/verification_code')
-
-    auth_url = f"{YANDEX_AUTH_URL}?response_type=code&client_id={os.getenv('YANDEX_CLIENT_ID')}&redirect_uri={redirect_uri}&scope={YANDEX_SCOPES}"
-
-    # Логируем URL для отладки
+    scopes = quote_plus(YANDEX_SCOPES)
+    auth_url = f"{YANDEX_AUTH_URL}?response_type=code&client_id={os.getenv('YANDEX_CLIENT_ID')}&redirect_uri={redirect_uri}&scope={scopes}"
     logging.info(f"Generated auth URL: {auth_url}")
-
     await callback.message.answer(
         f"Пожалуйста, перейдите по ссылке для авторизации:\n{auth_url}\n\n"
         "После авторизации, отправьте мне полученный код."
@@ -353,19 +366,9 @@ async def process_auth_button(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "auth_gmail")
-async def process_gmail_auth(callback: types.CallbackQuery, state: FSMContext):
-    # Получаем redirect_uri из .env или используем стандартный
-    redirect_uri = os.getenv('GMAIL_REDIRECT_URI', 'https://oauth2.googleapis.com/verification_code')
-
-    auth_url = f"{GMAIL_AUTH_URL}?response_type=code&client_id={os.getenv('GMAIL_CLIENT_ID')}&redirect_uri={redirect_uri}&scope={GMAIL_SCOPES}&access_type=offline&prompt=consent"
-
-    await callback.message.answer(
-        f"Пожалуйста, перейдите по ссылке для авторизации в Gmail:\n{auth_url}\n\n"
-        "После авторизации, отправьте мне полученный код."
-    )
-    await state.set_state(AuthStates.waiting_for_auth)
-    await callback.answer()
+@dp.callback_query(F.data == "gmail_stub")
+async def gmail_stub(callback: types.CallbackQuery):
+    await callback.answer("Gmail ещё в разработке. Следите за обновлениями!", show_alert=True)
 
 
 @dp.message(AuthStates.waiting_for_auth)
@@ -582,6 +585,138 @@ async def hide_full_email(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Error hiding full email: {str(e)}")
         await callback.answer("❌ Произошла ошибка при скрытии письма", show_alert=True)
+
+
+@dp.message(Command("send"))
+async def cmd_send(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in user_credentials or user_credentials[user_id]['service'] != 'yandex':
+        await message.answer("Сначала авторизуйтесь в Яндекс.Почте с помощью /start.")
+        return
+    await message.answer("Введите email получателя:")
+    await state.set_state(SendMailStates.waiting_for_recipient)
+
+
+@dp.message(SendMailStates.waiting_for_recipient)
+async def process_recipient(message: types.Message, state: FSMContext):
+    await state.update_data(recipient=message.text.strip())
+    await message.answer("Введите тему письма:")
+    await state.set_state(SendMailStates.waiting_for_subject)
+
+
+@dp.message(SendMailStates.waiting_for_subject)
+async def process_subject(message: types.Message, state: FSMContext):
+    await state.update_data(subject=message.text.strip())
+    await message.answer("Введите текст письма:")
+    await state.set_state(SendMailStates.waiting_for_body)
+
+
+@dp.message(SendMailStates.waiting_for_body)
+async def process_body(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    recipient = data['recipient']
+    subject = data['subject']
+    body = message.text.strip()
+    user_id = message.from_user.id
+
+    # Получаем email и токен
+    email_addr = user_credentials[user_id]['email']
+    access_token = user_credentials[user_id]['access_token']
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    msg = MIMEText(body, _charset="utf-8")
+    msg['Subject'] = subject
+    msg['From'] = email_addr
+    msg['To'] = recipient
+
+    try:
+        with smtplib.SMTP_SSL('smtp.yandex.ru', 465) as server:
+            # Создаем строку аутентификации для XOAUTH2
+            auth_string = f"user={email_addr}\1auth=Bearer {access_token}\1\1"
+            auth_string = base64.b64encode(auth_string.encode()).decode()
+
+            # Для SMTP_SSL не нужен starttls, сразу аутентифицируемся
+            server.ehlo()
+            server.docmd('AUTH', f'XOAUTH2 {auth_string}')
+
+            # Отправляем письмо
+            server.sendmail(email_addr, [recipient], msg.as_string())
+        await message.answer("✅ Письмо успешно отправлено!")
+    except Exception as e:
+        logging.error(f"Error sending email: {str(e)}")
+        await message.answer(f"❌ Не удалось отправить письмо: {e}")
+
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("reply_to_"))
+async def reply_to_email(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        email_id = callback.data.replace("reply_to_", "")
+        user_id = callback.from_user.id
+
+        if user_id in user_credentials and 'email_texts' in user_credentials[user_id] and email_id in \
+                user_credentials[user_id]['email_texts']:
+            email_data = user_credentials[user_id]['email_texts'][email_id]
+
+            # Сохраняем данные письма для ответа
+            await state.update_data(
+                reply_to=email_data['from_addr'],
+                reply_subject=f"Re: {email_data['subject']}"
+            )
+
+            await callback.message.answer(
+                f"Введите текст ответа для письма от {email_data['from_addr']}:"
+            )
+            await state.set_state(ReplyMailStates.waiting_for_reply_body)
+            await callback.answer()
+        else:
+            await callback.answer("❌ Письмо не найдено", show_alert=True)
+    except Exception as e:
+        logging.error(f"Error preparing reply: {str(e)}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
+
+
+@dp.message(ReplyMailStates.waiting_for_reply_body)
+async def process_reply_body(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    recipient = data['reply_to']
+    subject = data['reply_subject']
+    body = message.text.strip()
+    user_id = message.from_user.id
+
+    # Получаем email и токен
+    email_addr = user_credentials[user_id]['email']
+    access_token = user_credentials[user_id]['access_token']
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    msg = MIMEText(body, _charset="utf-8")
+    msg['Subject'] = subject
+    msg['From'] = email_addr
+    msg['To'] = recipient
+
+    try:
+        with smtplib.SMTP_SSL('smtp.yandex.ru', 465) as server:
+            # Создаем строку аутентификации для XOAUTH2
+            auth_string = f"user={email_addr}\1auth=Bearer {access_token}\1\1"
+            auth_string = base64.b64encode(auth_string.encode()).decode()
+
+            # Для SMTP_SSL не нужен starttls, сразу аутентифицируемся
+            server.ehlo()
+            server.docmd('AUTH', f'XOAUTH2 {auth_string}')
+
+            # Отправляем письмо
+            server.sendmail(email_addr, [recipient], msg.as_string())
+        await message.answer("✅ Ответ успешно отправлен!")
+    except Exception as e:
+        logging.error(f"Error sending reply: {str(e)}")
+        await message.answer(f"❌ Не удалось отправить ответ: {e}")
+
+    await state.clear()
 
 
 async def main():
